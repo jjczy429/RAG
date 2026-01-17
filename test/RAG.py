@@ -1,15 +1,14 @@
-"""
-RAG内容安全审核系统 - 基于领域知识库的检索增强生成系统
-依赖安装：
-pip install streamlit pandas numpy sentence-transformers openai zhipuai dashscope python-dotenv
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import pickle
 import os
 from sentence_transformers import SentenceTransformer
+
+try:
+    from FlagEmbedding import FlagReranker
+except Exception:
+    FlagReranker = None
 from datetime import datetime
 import json
 from openai import OpenAI
@@ -17,6 +16,7 @@ import dashscope
 from zhipuai import ZhipuAI
 from typing import List, Dict, Any, Optional, Tuple
 import heapq
+from pathlib import Path
 
 
 # ==================== 配置部分 ====================
@@ -27,6 +27,16 @@ class Config:
     VECTOR_DIM = 384
     TOP_K = 5
     RERANK_TOP_K = 3
+
+    # 各 provider 的 Base URL（写死在代码里；如需走代理/私有化部署请在此修改）
+    OPENAI_BASE_URL = "https://api.zhizengzeng.com/v1"
+    DASHSCOPE_BASE_URL = ""
+    ZHIPU_BASE_URL = ""
+
+    # 重排序（BAAI）配置
+    RERANKER_MODEL = "BAAI/bge-reranker-base"
+    RERANK_CANDIDATES = 10
+    RERANK_USE_FP16 = True
 
     # LLM配置
     SUPPORTED_MODELS = {
@@ -72,18 +82,13 @@ class NumpyVectorIndex:
         # 计算余弦相似度 (内积，因为向量已经归一化)
         similarities = np.dot(query, self.vectors.T)  # shape: (1, n_vectors)
         
-        # 获取top-k
-        if k >= len(self.vectors):
-            k = len(self.vectors)
-        
-        # 使用堆来获取top-k
+        # 获取 top-k（夹紧到合法范围）
         if k <= 0:
             return np.empty((1, 0), dtype=np.float32), np.empty((1, 0), dtype=np.int64)
 
         # np.argpartition 的 kth 是 0-based，必须 < n
         n = similarities.shape[1]
-        if k > n:
-            k = n
+        k = min(k, len(self.vectors), n)
 
         top_k_indices = np.argpartition(-similarities[0], k - 1)[:k]
         top_k_scores = similarities[0][top_k_indices]
@@ -117,20 +122,74 @@ class NumpyVectorIndex:
         return index
 
 
+# ==================== API Key 本地持久化 ====================
+class ApiKeyStore:
+    """本地保存/读取各 provider 的 API Key。
+
+    说明：
+    - 默认保存在用户目录下的 .rag_api_keys.json（不建议提交到仓库）
+    - 也可通过环境变量 RAG_API_KEYS_PATH 指定路径
+    """
+
+    @staticmethod
+    def _default_path() -> Path:
+        env = os.environ.get("RAG_API_KEYS_PATH")
+        if env:
+            return Path(env).expanduser()
+        return Path.home() / ".rag_api_keys.json"
+
+    @classmethod
+    def load_all(cls) -> Dict[str, str]:
+        path = cls._default_path()
+        try:
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items() if v}
+            return {}
+        except Exception:
+            return {}
+
+    @classmethod
+    def save_key(cls, provider: str, api_key: str) -> None:
+        path = cls._default_path()
+        data = cls.load_all()
+        data[str(provider)] = str(api_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @classmethod
+    def get_key(cls, provider: str) -> str:
+        return cls.load_all().get(str(provider), "")
+
+
 # ==================== LLM API调用类 ====================
 class LLMClient:
-    def __init__(self, provider, model, api_key):
+    def __init__(self, provider, model, api_key, base_url: str = ""):
         """初始化LLM客户端"""
         self.provider = provider
         self.model = model
         self.api_key = api_key
+        self.base_url = (base_url or "").strip()
 
         if provider == "openai":
-            self.client = OpenAI(api_key=api_key)
+            if self.base_url:
+                self.client = OpenAI(api_key=api_key, base_url=self.base_url)
+            else:
+                self.client = OpenAI(api_key=api_key)
         elif provider == "dashscope":
             dashscope.api_key = api_key
+            # dashscope SDK 通常不需要 base_url；保留配置位以便后续扩展
         elif provider == "zhipu":
-            self.client = ZhipuAI(api_key=api_key)
+            try:
+                if self.base_url:
+                    self.client = ZhipuAI(api_key=api_key, base_url=self.base_url)
+                else:
+                    self.client = ZhipuAI(api_key=api_key)
+            except TypeError:
+                # 兼容旧版 SDK（不支持 base_url 参数）
+                self.client = ZhipuAI(api_key=api_key)
 
     def generate(self, prompt, temperature=0.7, max_tokens=2000):
         """调用LLM生成回答"""
@@ -357,27 +416,50 @@ class VectorDatabase:
 # ==================== RAG检索增强生成类 ====================
 # [RAGSystem 类保持不变，与原始代码相同]
 class RAGSystem:
-    def __init__(self, vector_db, llm_client=None):
+    def __init__(self, vector_db, llm_client=None, reranker_model: str = Config.RERANKER_MODEL, rerank_use_fp16: bool = Config.RERANK_USE_FP16):
         self.vector_db = vector_db
         self.llm_client = llm_client
+        self.reranker_model = reranker_model
+        self.rerank_use_fp16 = rerank_use_fp16
+        self._reranker = None
 
     def set_llm_client(self, llm_client):
         """设置LLM客户端"""
         self.llm_client = llm_client
 
-    def rerank(self, query, results, top_k=Config.RERANK_TOP_K):
-        """重排序检索结果"""
+    def _get_reranker(self):
+        if self._reranker is not None:
+            return self._reranker
+
+        if FlagReranker is None:
+            self._reranker = None
+            return None
+
+        try:
+            self._reranker = FlagReranker(self.reranker_model, use_fp16=self.rerank_use_fp16)
+        except Exception:
+            self._reranker = None
+        return self._reranker
+
+    def rerank(self, query, results, top_k: int = Config.RERANK_TOP_K):
+        """使用 BAAI reranker 对检索结果重排"""
         if not results:
             return []
 
-        query_lower = query.lower()
+        reranker = self._get_reranker()
+        if reranker is None:
+            return results[:top_k]
 
-        for result in results:
-            text_lower = result['text'].lower()
-            keyword_match = sum(1 for word in query_lower.split() if word in text_lower)
-            result['rerank_score'] = result['score'] * 0.7 + (keyword_match / max(len(query_lower.split()), 1)) * 0.3
+        pairs = [[query, r.get('text', '')] for r in results]
+        try:
+            scores = reranker.compute_score(pairs)
+        except Exception:
+            return results[:top_k]
 
-        results.sort(key=lambda x: x['rerank_score'], reverse=True)
+        for r, s in zip(results, scores):
+            r['rerank_score'] = float(s)
+
+        results.sort(key=lambda x: x.get('rerank_score', x.get('score', 0.0)), reverse=True)
         return results[:top_k]
 
     def generate_context(self, results):
@@ -394,26 +476,16 @@ class RAGSystem:
 
     def generate_prompt(self, query, context):
         """生成提示词"""
-        prompt = f"""你是一个基于领域知识库的内容安全审核助手。请根据提供的知识库内容回答用户问题。
+        prompt = f"""{query}
 
-知识库内容：
-{context}
-
-用户问题：{query}
-
-请基于上述知识库内容回答问题。如果知识库中没有相关信息，请明确说明。回答要求：
-1. 准确引用知识库内容
-2. 保持客观中立
-3. 如涉及敏感内容，需要特别谨慎
-4. 说明判断依据
-
-回答："""
+{context}"""
         return prompt
 
     def answer(self, query, use_rerank=True, temperature=0.7):
         """回答用户问题"""
-        # 检索
-        results = self.vector_db.search(query, top_k=Config.TOP_K)
+        # 先检索较多候选，再重排截断
+        candidates_k = max(Config.TOP_K, Config.RERANK_CANDIDATES)
+        results = self.vector_db.search(query, top_k=candidates_k)
 
         if not results:
             return {
@@ -422,9 +494,8 @@ class RAGSystem:
                 'retrieved_docs': []
             }
 
-        # 重排序
         if use_rerank:
-            results = self.rerank(query, results)
+            results = self.rerank(query, results, top_k=Config.RERANK_TOP_K)
         else:
             results = results[:Config.RERANK_TOP_K]
 
@@ -486,11 +557,22 @@ def main():
 
             model_info = Config.SUPPORTED_MODELS[selected_model]
 
+            saved_key = ApiKeyStore.get_key(model_info["provider"])
+
             api_key = st.text_input(
                 "API密钥",
                 type="password",
-                help=f"请输入{selected_model}的API密钥"
+                value=saved_key,
+                help=f"请输入{selected_model}的API密钥（会在本机保存，后续自动填充）"
             )
+
+            base_url = ""
+            if model_info["provider"] == "openai":
+                base_url = Config.OPENAI_BASE_URL
+            elif model_info["provider"] == "dashscope":
+                base_url = Config.DASHSCOPE_BASE_URL
+            elif model_info["provider"] == "zhipu":
+                base_url = Config.ZHIPU_BASE_URL
 
             col1, col2 = st.columns(2)
             with col1:
@@ -499,15 +581,19 @@ def main():
                 if st.button("保存配置", type="primary"):
                     if api_key:
                         try:
+                            # 保存API Key到本地，后续运行自动填充
+                            ApiKeyStore.save_key(model_info["provider"], api_key)
+
                             llm_client = LLMClient(
                                 provider=model_info["provider"],
                                 model=model_info["model"],
-                                api_key=api_key
+                                api_key=api_key,
+                                base_url=base_url
                             )
                             st.session_state.rag_system.set_llm_client(llm_client)
                             st.session_state.llm_configured = True
                             st.session_state.temperature = temperature
-                            st.success("✅ 配置成功！")
+                            st.success("✅ 配置已保存！")
                         except Exception as e:
                             st.error(f"❌ 配置失败：{str(e)}")
                     else:
@@ -516,21 +602,6 @@ def main():
             if st.session_state.llm_configured:
                 st.success(f"✅ 当前模型：{selected_model}")
 
-            # API获取指南
-            with st.expander("📖 API密钥获取指南"):
-                st.markdown("""
-                **OpenAI**
-                - 官网：https://platform.openai.com/
-                - 注册后在API Keys页面创建
-
-                **通义千问**
-                - 官网：https://dashscope.aliyun.com/
-                - 阿里云账号登录后获取
-
-                **智谱AI**
-                - 官网：https://open.bigmodel.cn/
-                - 注册后在个人中心获取
-                """)
 
         st.markdown("---")
         st.header("📊 知识库管理")
