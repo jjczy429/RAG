@@ -44,21 +44,19 @@ class Config:
     # 支持的 Embedding 模型列表（名称 -> HuggingFace model id）
     # 第一项为默认值，请确保对应模型已在本地缓存，否则启动时会尝试联网下载
     SUPPORTED_EMBEDDING_MODELS = {
-        "Multilingual-MiniLM（轻量多语言，默认）": "paraphrase-multilingual-MiniLM-L12-v2",
-        "BGE-M3（多语言）": "BAAI/bge-m3",
-        "BGE-Large-ZH（中文大模型）": "BAAI/bge-large-zh-v1.5",
-        "BGE-Base-ZH（中文基础）": "BAAI/bge-base-zh-v1.5",
-        "BGE-Small-ZH（中文轻量）": "BAAI/bge-small-zh-v1.5",
-        "BGE-Large-EN（英文大模型）": "BAAI/bge-large-en-v1.5",
-        "BGE-Base-EN（英文基础）": "BAAI/bge-base-en-v1.5",
+        "Multilingual-MiniLM": "paraphrase-multilingual-MiniLM-L12-v2",
+        "BGE-M3": "BAAI/bge-m3",
+        "BGE-Large-ZH": "BAAI/bge-large-zh-v1.5",
+        "BGE-Base-ZH": "BAAI/bge-base-zh-v1.5",
+        "BGE-Small-ZH": "BAAI/bge-small-zh-v1.5",
     }
 
     # 支持的 Reranker 模型列表（名称 -> HuggingFace model id）
     # 第一项为默认值，请确保对应模型已在本地缓存
     SUPPORTED_RERANKER_MODELS = {
-        "BGE-Reranker-Base（默认）": "BAAI/bge-reranker-base",
-        "BGE-Reranker-V2-M3（多语言）": "BAAI/bge-reranker-v2-m3",
-        "BGE-Reranker-Large（大模型）": "BAAI/bge-reranker-large",
+        "BGE-Reranker-Base": "BAAI/bge-reranker-base",
+        "BGE-Reranker-V2-M3": "BAAI/bge-reranker-v2-m3",
+        "BGE-Reranker-Large": "BAAI/bge-reranker-large",
     }
 
     # LLM配置
@@ -809,7 +807,6 @@ def main():
     st.set_page_config(page_title="内容安全审核系统", page_icon="🛡️", layout="wide")
 
     st.title("🛡️ 基于领域知识库的内容安全审核系统")
-    st.markdown("**毕设题目：基于领域知识库的内容安全审核系统的设计与实现**")
     st.markdown("---")
 
     # 初始化 session_state 默认值
@@ -964,10 +961,15 @@ def main():
                             break
                         except Exception:
                             continue
-                    st.write("文件预览（前3行）：", df_preview.head(3))
+                    else:
+                        # 所有编码都失败
+                        df_preview = None
+                        st.error("❌ 文件编码无法识别，请检查文件编码")
+                    if df_preview is not None:
+                        st.write("文件预览（前3行）：", df_preview.head(3))
                 except Exception as e:
                     st.error(f"❌ 文件读取失败：{e}")
-                df_preview = None
+                    df_preview = None
             else:
                 df_preview = None
                 st.info("💡 请上传 CSV 文件以构建或刷新知识库。")
